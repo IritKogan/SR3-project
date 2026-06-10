@@ -1,0 +1,68 @@
+class SR3Diffusion(nn.Module):
+    def __init__(self, denoise_fn, timesteps=1000, loss_type='l1'):
+        super().__init__()
+        self.denoise_fn = denoise_fn
+        self.timesteps = timesteps
+        self.loss_type = loss_type
+
+        beta = torch.linspace(1e-4, 0.02, timesteps, dtype=torch.float32)
+        alpha = 1.0 - beta
+        alpha_bar = torch.cumprod(alpha, dim=0)
+
+        self.register_buffer('betas', beta)
+        self.register_buffer('alphas_bar', alpha_bar)
+        self.register_buffer('sqrt_alphas_bar', torch.sqrt(alpha_bar))
+        self.register_buffer('sqrt_one_minus_alphas_bar', torch.sqrt(1.0 - alpha_bar))
+
+    def q_sample(self, x_hr, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_hr)
+
+        sqrt_alpha_bar_t = self.sqrt_alphas_bar[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1, 1)
+
+        return sqrt_alpha_bar_t * x_hr + sqrt_one_minus_alpha_bar_t * noise
+
+    def forward(self, x_hr, x_lr, t):
+        noise = torch.randn_like(x_hr)
+        x_noisy = self.q_sample(x_hr=x_hr, t=t, noise=noise)
+
+        # Bicubic upscale low-res condition to match high-res dimensions
+        x_lr_upscaled = F.interpolate(x_lr, size=x_hr.shape[-2:], mode='bicubic', align_corners=False)
+
+        # Concatenate condition along channel dimension
+        predicted_noise = self.denoise_fn(torch.cat([x_noisy, x_lr_upscaled], dim=1), t)
+
+        if self.loss_type == 'l1':
+            return F.l1_loss(noise, predicted_noise)
+        else:
+            return F.mse_loss(noise, predicted_noise)
+
+    @torch.no_grad()
+    def p_sample_loop(self, x_lr):
+        batch_size = x_lr.shape[0]
+        hr_shape = (batch_size, 3, x_lr.shape[2] * 4, x_lr.shape[3] * 4)
+
+        img = torch.randn(hr_shape, device=device)
+        x_lr_upscaled = F.interpolate(x_lr, size=hr_shape[-2:], mode='bicubic', align_corners=False)
+
+        for i in tqdm(reversed(range(self.timesteps)), desc='Refinement Steps', total=self.timesteps):
+            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+
+            model_input = torch.cat([img, x_lr_upscaled], dim=1)
+            pred_noise = self.denoise_fn(model_input, t)
+
+            beta_t = self.betas[t].view(-1, 1, 1, 1)
+            sqrt_alpha_bar_t = self.sqrt_alphas_bar[t].view(-1, 1, 1, 1)
+            sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1, 1)
+            alpha_t = (1.0 - beta_t)
+
+            mean = (1 / torch.sqrt(alpha_t)) * (img - (beta_t / sqrt_one_minus_alpha_bar_t) * pred_noise)
+
+            if i > 0:
+                noise = torch.randn_like(img)
+                sigma_t = torch.sqrt(beta_t)
+                img = mean + sigma_t * noise
+            else:
+                img = mean
+        return img
